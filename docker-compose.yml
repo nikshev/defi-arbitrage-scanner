@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  janusgraph:
+    image: janusgraph/janusgraph:1.0.0
+    ports:
+      - "8182:8182"
+    environment:
+      - JAVA_OPTIONS=-Xms512m -Xmx2g
+    healthcheck:
+      test: ["CMD", "bin/gremlin.sh", "-e", "scripts/remote-connect.groovy"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  app:
+    build: .
+    depends_on:
+      janusgraph:
+        condition: service_healthy
+    environment:
+      - INFURA_RPC_URL=${INFURA_RPC_URL}
+      - JANUSGRAPH_HOST=janusgraph
+    volumes:
+      - ./data:/app/data
+    command: python -m fetcher.dex_fetcher
+
+  dashboard:
+    build:
+      context: ./dashboard
+    ports:
+      - "8501:8501"
+    depends_on:
+      - app
+    environment:
+      - JANUSGRAPH_HOST=janusgraph

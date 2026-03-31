@@ -1,0 +1,39 @@
+ethereum:
+  rpc_url: "${INFURA_RPC_URL}"
+  chain_id: 1
+
+tokens:
+  - symbol: ETH
+    address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+  - symbol: USDC
+    address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+  - symbol: DAI
+    address: "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+  - symbol: WBTC
+    address: "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+
+dex:
+  uniswap_v2:
+    factory: "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+    enabled: true
+  uniswap_v3:
+    factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+    enabled: true
+  sushiswap:
+    factory: "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"
+    enabled: true
+
+janusgraph:
+  host: "localhost"
+  port: 8182
+  traversal_source: "g"
+
+arbitrage:
+  min_profit_ratio: 0.005   # 0.5%
+  max_cycles: 50
+  update_interval_seconds: 30
+
+spark:
+  app_name: "DeFiArbitrageAnalysis"
+  snapshots_path: "data/snapshots"
+  report_path: "data/reports"
