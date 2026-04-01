@@ -1,0 +1,20 @@
+[
+  {
+    "name": "get_dy",
+    "type": "function",
+    "inputs": [
+      {"name": "i", "type": "int128"},
+      {"name": "j", "type": "int128"},
+      {"name": "dx", "type": "uint256"}
+    ],
+    "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view"
+  },
+  {
+    "name": "coins",
+    "type": "function",
+    "inputs": [{"name": "i", "type": "uint256"}],
+    "outputs": [{"name": "", "type": "address"}],
+    "stateMutability": "view"
+  }
+]

@@ -26,6 +26,41 @@ if str(_ROOT) not in sys.path:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Network helpers
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _get_network_stats() -> Dict[str, float]:
+    """Fetch current ETH price (USD) and gas price (Gwei) via public APIs."""
+    eth_price = 2130.0
+    gas_gwei = 20.0
+    try:
+        import requests
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "ethereum", "vs_currencies": "usd"},
+            timeout=5,
+        )
+        if r.ok:
+            eth_price = r.json()["ethereum"]["usd"]
+    except Exception:
+        pass
+    try:
+        import requests
+        r = requests.get(
+            "https://api.etherscan.io/api",
+            params={"module": "gastracker", "action": "gasoracle"},
+            timeout=5,
+        )
+        if r.ok:
+            data = r.json().get("result", {})
+            gas_gwei = float(data.get("ProposeGasPrice", gas_gwei))
+    except Exception:
+        pass
+    return {"eth_price_usd": eth_price, "gas_price_gwei": gas_gwei}
+
+
+# ---------------------------------------------------------------------------
 # Page config — must be first Streamlit call
 # ---------------------------------------------------------------------------
 st.set_page_config(
@@ -85,13 +120,14 @@ def _get_analyzer(config: Dict):
 # ---------------------------------------------------------------------------
 
 def fetch_opportunities(
-    finder, min_profit: float
+    finder, min_profit: float, eth_price: float, gas_gwei: float
 ) -> List[Dict[str, Any]]:
-    """Fetch live arbitrage opportunities, falling back to empty list."""
+    """Fetch live arbitrage opportunities enriched with cost breakdown."""
     if finder is None:
         return []
     try:
-        return finder.find_triangular_arbitrage(min_profit=min_profit)
+        opps = finder.find_triangular_arbitrage(min_profit=min_profit)
+        return finder.enrich_with_economics(opps, eth_price, gas_gwei)
     except Exception as exc:
         st.warning(f"Error fetching opportunities: {exc}")
         return []
@@ -137,34 +173,201 @@ def _profit_color(profit_ratio: float) -> str:
     return "red"
 
 
-def render_opportunities_table(opportunities: List[Dict]) -> None:
-    """Render the live opportunities as a styled dataframe."""
+def _fmt_usd(val) -> str:
+    return f"${val:,.0f}" if val is not None else "—"
+
+
+def render_opportunities_table(
+    opportunities: List[Dict], eth_price: float, gas_gwei: float
+) -> None:
+    """Render opportunities with three execution strategy tabs."""
     if not opportunities:
         st.info("No arbitrage opportunities found above the selected threshold.")
         return
 
-    rows = []
-    for opp in opportunities:
-        rows.append(
-            {
-                "Path": _format_path(opp.get("path", [])),
-                "Profit %": f"{opp.get('profit_ratio', 0) * 100:.3f}%",
-                "DEXes": _format_dexes(opp.get("dexes", [])),
-                "Timestamp": opp.get("timestamp", ""),
-            }
+    avg_gas = sum(o.get("gas_cost_usd", 0) for o in opportunities) / len(opportunities)
+    best_net = max(o.get("net_spread_pct", 0) for o in opportunities)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ETH Price", f"${eth_price:,.0f}")
+    c2.metric("Gas Price", f"{gas_gwei:.1f} Gwei")
+    c3.metric("Avg Gas Cost / Cycle", f"${avg_gas:.2f}")
+    c4.metric("Best Net Spread", f"{best_net:.3f}%")
+
+    st.markdown("---")
+
+    tab1, tab2, tab3 = st.tabs([
+        "🏦 Regular (own capital)",
+        "⚡ Flashloan (Aave V3 / Balancer)",
+        "🤖 Flashloan + Flashbots (MEV)",
+    ])
+
+    # ── Tab 1: Regular ───────────────────────────────────────────────────────
+    with tab1:
+        st.caption(
+            "You execute 3 separate swaps with your own capital. "
+            "Risk: frontrunning, gas paid upfront."
+        )
+        rows = []
+        for opp in opportunities:
+            dep = opp.get("min_deposit_usd")
+            rows.append({
+                "Path":          _format_path(opp.get("path", [])),
+                "DEXes":         _format_dexes(opp.get("dexes", [])),
+                "Gross Spread":  opp.get("gross_spread_pct", 0),
+                "DEX Fees":      opp.get("dex_fees_pct", 0),
+                "Net Spread":    opp.get("net_spread_pct", 0),
+                "Gas (units)":   opp.get("gas_units", 0),
+                "Gas Cost $":    opp.get("gas_cost_usd", 0),
+                "Min Deposit":   _fmt_usd(dep),
+                "Profit @$1K":   opp.get("profit_at_1k_usd", 0),
+                "Profit @$10K":  opp.get("profit_at_10k_usd", 0),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+            column_config={
+                "Gross Spread": st.column_config.NumberColumn("Gross Spread %", format="%.3f%%"),
+                "DEX Fees":     st.column_config.NumberColumn("DEX Fees %", format="%.3f%%"),
+                "Net Spread":   st.column_config.NumberColumn("Net Spread %", format="%.3f%%"),
+                "Gas (units)":  st.column_config.NumberColumn("Gas Units", format="%d"),
+                "Gas Cost $":   st.column_config.NumberColumn("Gas Cost", format="$%.2f"),
+                "Profit @$1K":  st.column_config.NumberColumn("Profit @$1K", format="$%.2f"),
+                "Profit @$10K": st.column_config.NumberColumn("Profit @$10K", format="$%.2f"),
+            })
+
+        # Profit vs deposit chart
+        deposit_range = [500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000]
+        fig_reg = go.Figure()
+        for opp in opportunities[:5]:
+            net = opp.get("net_spread_pct", 0) / 100
+            gas = opp.get("gas_cost_usd", 0)
+            label = " → ".join(opp.get("path", []))
+            fig_reg.add_trace(go.Scatter(
+                x=deposit_range,
+                y=[max(0, d * net - gas) for d in deposit_range],
+                mode="lines+markers", name=label,
+            ))
+        fig_reg.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="Break-even")
+        fig_reg.update_layout(
+            title="Profit vs Deposit (own capital)",
+            xaxis_title="Deposit ($)", yaxis_title="Net Profit ($)",
+            xaxis=dict(tickformat="$,.0f"), height=360,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", y=-0.25), margin=dict(l=20, r=20, t=40, b=80),
+        )
+        st.plotly_chart(fig_reg, use_container_width=True, key="chart_regular")
+
+    # ── Tab 2: Flashloan ────────────────────────────────────────────────────
+    with tab2:
+        st.caption(
+            "Borrow the full notional in one atomic tx — repay within the same block. "
+            "**Capital needed = only gas ETH** (no own trade capital required)."
+        )
+        fl_cols = st.columns(2)
+        for col_idx, fl_name in enumerate(["aave_v3", "balancer"]):
+            label = "Aave V3 (fee 0.05%)" if fl_name == "aave_v3" else "Balancer (fee 0%)"
+            with fl_cols[col_idx]:
+                st.subheader(label)
+                rows_fl = []
+                for opp in opportunities:
+                    fl = opp.get("flashloan", {}).get(fl_name, {})
+                    rows_fl.append({
+                        "Path":           _format_path(opp.get("path", [])),
+                        "Net Spread":     fl.get("fl_net_spread_pct", 0),
+                        "Gas $":          fl.get("fl_gas_usd", 0),
+                        "Capital Needed": _fmt_usd(fl.get("capital_needed_usd")),
+                        "Min Borrow":     _fmt_usd(fl.get("min_notional_usd")),
+                        "Profit @$10K":   fl.get("profit_at_10k_usd", 0),
+                        "Profit @$50K":   fl.get("profit_at_50k_usd", 0),
+                        "Viable":         "✅" if fl.get("viable") else "❌",
+                    })
+                st.dataframe(pd.DataFrame(rows_fl), use_container_width=True, hide_index=True,
+                    column_config={
+                        "Net Spread":   st.column_config.NumberColumn("Net Spread %", format="%.3f%%"),
+                        "Gas $":        st.column_config.NumberColumn("Gas Cost", format="$%.2f"),
+                        "Profit @$10K": st.column_config.NumberColumn("Profit @$10K", format="$%.2f"),
+                        "Profit @$50K": st.column_config.NumberColumn("Profit @$50K", format="$%.2f"),
+                    })
+
+        st.markdown("---")
+        notional_range = [5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000]
+        fig_fl = go.Figure()
+        for fl_name, dash, color in [("aave_v3", "solid", "#636EFA"), ("balancer", "dash", "#EF553B")]:
+            fl_label = "Aave V3" if fl_name == "aave_v3" else "Balancer"
+            for opp in opportunities[:3]:
+                fl = opp.get("flashloan", {}).get(fl_name, {})
+                net = fl.get("fl_net_spread_pct", 0) / 100
+                gas = fl.get("fl_gas_usd", 0)
+                path = " → ".join(opp.get("path", []))
+                fig_fl.add_trace(go.Scatter(
+                    x=notional_range,
+                    y=[max(0, n * net - gas) for n in notional_range],
+                    mode="lines+markers", name=f"{fl_label}: {path}",
+                    line=dict(dash=dash, color=color),
+                ))
+        fig_fl.add_hline(y=0, line_dash="dot", line_color="gray", annotation_text="Break-even")
+        fig_fl.update_layout(
+            title="Profit vs Borrowed Notional (flashloan, capital needed = gas only)",
+            xaxis_title="Borrowed Notional ($)", yaxis_title="Net Profit ($)",
+            xaxis=dict(tickformat="$,.0f"), height=380,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", y=-0.3), margin=dict(l=20, r=20, t=40, b=100),
+        )
+        st.plotly_chart(fig_fl, use_container_width=True, key="chart_flashloan")
+
+    # ── Tab 3: Flashbots ────────────────────────────────────────────────────
+    with tab3:
+        fb_share = opportunities[0].get("flashbots", {}).get("builder_share_pct", 85)
+        searcher_share = opportunities[0].get("flashbots", {}).get("searcher_share_pct", 15)
+        st.caption(
+            f"Private bundle via Flashbots — frontrunning/sandwich impossible. "
+            f"Builder takes **{fb_share:.0f}%** of arb profit; you keep **{searcher_share:.0f}%**. "
+            f"Capital needed = **only gas ETH** (Balancer flashloan for notional)."
         )
 
-    df = pd.DataFrame(rows)
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Profit %": st.column_config.TextColumn("Profit %", width="small"),
-            "Path": st.column_config.TextColumn("Path", width="large"),
-            "DEXes": st.column_config.TextColumn("DEXes", width="medium"),
-        },
-    )
+        rows_fb = []
+        for opp in opportunities:
+            fb = opp.get("flashbots", {})
+            rows_fb.append({
+                "Path":            _format_path(opp.get("path", [])),
+                "Gross Spread":    opp.get("gross_spread_pct", 0),
+                "Searcher Net %":  fb.get("fb_net_spread_pct", 0),
+                "Gas $":           fb.get("fl_gas_usd", 0),
+                "Capital Needed":  _fmt_usd(fb.get("capital_needed_usd")),
+                "Min Borrow":      _fmt_usd(fb.get("min_notional_usd")),
+                "Profit @$50K":    fb.get("profit_at_50k_usd", 0),
+                "Profit @$100K":   fb.get("profit_at_100k_usd", 0),
+                "Viable":          "✅" if fb.get("viable") else "❌",
+            })
+        st.dataframe(pd.DataFrame(rows_fb), use_container_width=True, hide_index=True,
+            column_config={
+                "Gross Spread":   st.column_config.NumberColumn("Gross Spread %", format="%.3f%%"),
+                "Searcher Net %": st.column_config.NumberColumn("Searcher Net %", format="%.3f%%"),
+                "Gas $":          st.column_config.NumberColumn("Gas Cost", format="$%.2f"),
+                "Profit @$50K":   st.column_config.NumberColumn("Profit @$50K", format="$%.2f"),
+                "Profit @$100K":  st.column_config.NumberColumn("Profit @$100K", format="$%.2f"),
+            })
+
+        notional_range = [10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000]
+        fig_fb = go.Figure()
+        for opp in opportunities[:5]:
+            fb = opp.get("flashbots", {})
+            net = fb.get("fb_net_spread_pct", 0) / 100
+            gas = fb.get("fl_gas_usd", 0)
+            path = " → ".join(opp.get("path", []))
+            fig_fb.add_trace(go.Scatter(
+                x=notional_range,
+                y=[max(0, n * net - gas) for n in notional_range],
+                mode="lines+markers", name=path,
+            ))
+        fig_fb.add_hline(y=0, line_dash="dot", line_color="gray", annotation_text="Break-even")
+        fig_fb.update_layout(
+            title=f"Searcher Profit vs Notional (Flashbots, builder takes {fb_share:.0f}%)",
+            xaxis_title="Borrowed Notional ($)", yaxis_title="Searcher Profit ($)",
+            xaxis=dict(tickformat="$,.0f"), height=380,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", y=-0.25), margin=dict(l=20, r=20, t=40, b=80),
+        )
+        st.plotly_chart(fig_fb, use_container_width=True, key="chart_flashbots")
 
 
 def render_graph_visualization(opportunities: List[Dict]) -> None:
@@ -252,7 +455,7 @@ def render_graph_visualization(opportunities: List[Dict]) -> None:
                 margin=dict(l=20, r=20, t=50, b=20),
             ),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="arb_cycle_graph")
 
     except ImportError:
         st.warning("networkx is required for graph visualisation.")
@@ -286,7 +489,7 @@ def render_historical_charts(historical: Dict[str, pd.DataFrame]) -> None:
                 coloraxis_showscale=False,
                 height=350,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="hist_by_pair")
         else:
             st.info("No pair data available.")
 
@@ -308,7 +511,7 @@ def render_historical_charts(historical: Dict[str, pd.DataFrame]) -> None:
             )
             fig.update_traces(line=dict(color="#1f77b4", width=2))
             fig.update_layout(height=350)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="hist_by_hour")
         else:
             st.info("No hourly data available.")
 
@@ -341,7 +544,7 @@ def render_price_heatmap(prices: Dict[str, Dict[str, float]]) -> None:
         text_auto=".3f",
     )
     fig.update_layout(height=400)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="price_heatmap")
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +556,9 @@ def main() -> None:
     fetcher = _get_fetcher(config)
     finder = _get_finder()
     analyzer = _get_analyzer(config)
+    net_stats = _get_network_stats()
+    eth_price = net_stats["eth_price_usd"]
+    gas_gwei = net_stats["gas_price_gwei"]
 
     # ------------------------------------------------------------------
     # Sidebar
@@ -414,51 +620,41 @@ def main() -> None:
 
     # --- Price Heatmap ---
     st.header("Current Price Spread Across DEXes")
-    heatmap_placeholder = st.empty()
 
     # --- Graph Visualization ---
     st.header("Arbitrage Cycle Graph")
-    graph_placeholder = st.empty()
 
     # --- Historical Analysis ---
     st.header("Historical Analysis")
-    hist_placeholder = st.empty()
 
     # ------------------------------------------------------------------
-    # Render loop
+    # Render (single pass — auto-refresh uses st.rerun)
     # ------------------------------------------------------------------
-    def render_all() -> None:
-        opportunities = fetch_opportunities(finder, min_profit)
-        prices = fetch_prices(fetcher)
-        historical = fetch_historical(analyzer)
+    opportunities = fetch_opportunities(finder, min_profit, eth_price, gas_gwei)
+    prices = fetch_prices(fetcher)
+    historical = fetch_historical(analyzer)
 
-        with opp_placeholder.container():
-            render_opportunities_table(opportunities)
+    with opp_placeholder.container():
+        render_opportunities_table(opportunities, eth_price, gas_gwei)
 
-        with heatmap_placeholder.container():
-            if prices:
-                render_price_heatmap(prices)
-            else:
-                st.info("No live price data available.")
+    if prices:
+        render_price_heatmap(prices)
+    else:
+        st.info("No live price data available.")
 
-        with graph_placeholder.container():
-            render_graph_visualization(opportunities)
+    render_graph_visualization(opportunities)
 
-        with hist_placeholder.container():
-            if historical:
-                render_historical_charts(historical)
-            else:
-                st.info("Historical data not available.")
-
-    render_all()
+    if historical:
+        render_historical_charts(historical)
+    else:
+        st.info("Historical data not available.")
 
     if auto_refresh:
-        for _ in range(1000):
-            time.sleep(refresh_interval)
-            refresh_placeholder.caption(
-                f"Auto-refreshed at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
-            )
-            render_all()
+        time.sleep(refresh_interval)
+        refresh_placeholder.caption(
+            f"Auto-refreshed at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+        )
+        st.rerun()
 
 
 if __name__ == "__main__":

@@ -140,9 +140,15 @@ class HistoricalAnalyzer:
             frames = [pd.read_parquet(f) for f in parquet_files]
             df = pd.concat(frames, ignore_index=True)
         else:
-            spark = self._get_spark()
-            sdf = spark.read.parquet(str(snap_dir / "snapshot_*.parquet"))
-            df = sdf.toPandas()
+            try:
+                spark = self._get_spark()
+                sdf = spark.read.parquet(str(snap_dir / "snapshot_*.parquet"))
+                df = sdf.toPandas()
+            except Exception as exc:
+                logger.warning("Spark unavailable (%s). Falling back to pandas.", exc)
+                self._use_pandas = True
+                frames = [pd.read_parquet(f) for f in parquet_files]
+                df = pd.concat(frames, ignore_index=True)
 
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         logger.info(

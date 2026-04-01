@@ -8,10 +8,11 @@ services:
     environment:
       - JAVA_OPTIONS=-Xms512m -Xmx2g
     healthcheck:
-      test: ["CMD", "bin/gremlin.sh", "-e", "scripts/remote-connect.groovy"]
-      interval: 30s
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8182' 2>/dev/null || exit 1"]
+      interval: 15s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 60s
 
   app:
     build: .
@@ -21,16 +22,22 @@ services:
     environment:
       - INFURA_RPC_URL=${INFURA_RPC_URL}
       - JANUSGRAPH_HOST=janusgraph
+      - JANUSGRAPH_PORT=8182
     volumes:
       - ./data:/app/data
     command: python -m fetcher.dex_fetcher
+    restart: on-failure
 
   dashboard:
     build:
-      context: ./dashboard
+      context: .
+      dockerfile: dashboard/Dockerfile
     ports:
       - "8501:8501"
-    depends_on:
-      - app
     environment:
+      - INFURA_RPC_URL=${INFURA_RPC_URL}
       - JANUSGRAPH_HOST=janusgraph
+      - JANUSGRAPH_PORT=8182
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

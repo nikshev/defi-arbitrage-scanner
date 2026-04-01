@@ -1,0 +1,23 @@
+[
+  {
+    "name": "getPoolTokens",
+    "type": "function",
+    "inputs": [{"name": "poolId", "type": "bytes32"}],
+    "outputs": [
+      {"name": "tokens",          "type": "address[]"},
+      {"name": "balances",        "type": "uint256[]"},
+      {"name": "lastChangeBlock", "type": "uint256"}
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "name": "getPool",
+    "type": "function",
+    "inputs": [{"name": "poolId", "type": "bytes32"}],
+    "outputs": [
+      {"name": "pool",            "type": "address"},
+      {"name": "specialization",  "type": "uint8"}
+    ],
+    "stateMutability": "view"
+  }
+]
